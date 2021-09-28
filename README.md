@@ -38,7 +38,7 @@ Examples:
     python main.py dev 24h
 
     # Report on the last week on `test-staging`
-    python main.py dev 1w
+    python main.py test-staging 1w
 
 Example output:
 
