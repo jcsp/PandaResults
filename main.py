@@ -1,3 +1,4 @@
+import datetime
 import sys
 import os
 import logging
@@ -14,10 +15,12 @@ ORGANIZATION = "vectorized"
 PIPELINE = "redpanda"
 DUCKTAPE_JOBS = re.compile(r"(debug|release)-.+")
 DEFAULT_BRANCH = 'dev'
+DEFAULT_MAX_N = 10
 
 # Ducktape's strings for test status
 CASE_PASS = "pass"
 CASE_FAIL = "fail"
+CASE_IGNORE = "ignore"
 
 # Buildkite's strings for job status
 JOB_FAILED = 'failed'
@@ -114,7 +117,7 @@ class ResultReader:
         return r.text
 
     def get_path(self, path, *args, **kwargs):
-        return self.get(BASE_URL + path, *args, **kwargs).json()
+        return self.get(BASE_URL + path, *args, **kwargs)
 
     def _read_ducktape_results(self, results, build, job):
         any_failed = False
@@ -125,7 +128,7 @@ class ResultReader:
             report_artifact = artifacts_by_name['report.xml']
         except KeyError:
             log.warning(
-                f"No report.xml for build {build['id']} job {job['name']}")
+                f"No report.xml for job (status={job['state']}) {job['web_url']}")
             return
 
         # The buildkite API gives us a buildkite location for download, but
@@ -198,7 +201,7 @@ class ResultReader:
             # 57/64 Test #57: s3_single_thread_rpunit ...........................   Passed    1.56 sec^M
             for line in lines[:-1]:
                 line = line.strip()
-                line = line.decode('utf-8')
+                line = line.decode('utf-8', 'backslashreplace')
                 match = CTEST_RESULT_RE.match(line)
                 if match:
                     test_name, test_result = match.groups()
@@ -213,40 +216,78 @@ class ResultReader:
 
         return any_failed
 
-    def read(self, branch):
+    def _read_monolithic_results(self, results, build, job):
+        """
+        Treat a whole job like one test case
+        """
+        suite = klass = case = job['name']
+        status = CASE_PASS if job['state'] == JOB_PASSED else CASE_FAIL
+        results[TestCase(suite, klass, case)].append(
+            TestResult(build['number'], job['id'], suite, klass, case, status, None,
+                       job['web_url'], job['finished_at']))
+
+    def _read_build(self, results, build):
+        log.debug(
+            f"{build['finished_at']} {build['number']} {build['state']}")
+        for job in build['jobs']:
+            name = job['name']
+            if DUCKTAPE_JOBS.match(name) is None:
+                # Simplified handling for other jobs (e.g. k8s-operator).  Just report on the job
+                # like it's a single test suite + test case
+                self._read_monolithic_results(results, build, job)
+                continue
+
+            ducktape_fail = self._read_ducktape_results(
+                results, build, job)
+            ctest_fail = self._read_ctest_results(results, build, job)
+
+            if job['state'] != JOB_PASSED and not ducktape_fail and not ctest_fail:
+                # If a job is failed, we expect to have seen some test failures.  Otherwise log a warning
+                # to avoid wrongly ignoring failed jobs.
+                log.warning(
+                    f"Unexplained failure (state={job['state']}) on {job['web_url']}"
+                )
+            elif job['state'] == JOB_PASSED and (ducktape_fail
+                                                 or ctest_fail):
+                # Sanity check that our CI logic is correctly reporting the result of jobs
+                log.warning(
+                    f"Job passed but has test failures (state={job['state']}) on {job['web_url']}"
+                )
+
+    def read(self, branch, max_n=None, since=None):
         # Only interested in complete runs, not in progress or cancelled
         states = ["passed", "failed"]
 
         results = defaultdict(list)
 
-        path = f"organizations/{ORGANIZATION}/pipelines/{PIPELINE}/builds"
-        params = {'branch': branch, 'state[]': [states]}
-        builds = self.get_path(path, params=params)
-        log.debug(json.dumps(builds, indent=2))
-        for build in builds:
-            log.debug(
-                f"{build['finished_at']} {build['number']} {build['state']}")
-            for job in build['jobs']:
-                name = job['name']
-                if DUCKTAPE_JOBS.match(name) is None:
-                    continue
+        params = {'branch': branch, 'state[]': [states], 'per_page': 2}
 
-                ducktape_fail = self._read_ducktape_results(
-                    results, build, job)
-                ctest_fail = self._read_ctest_results(results, build, job)
+        if since is not None:
+            params['finished_from'] = since.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-                if job['state'] != JOB_PASSED and not ducktape_fail and not ctest_fail:
-                    # If a job is failed, we expect to have seen some test failures.  Otherwise log a warning
-                    # to avoid wrongly ignoring failed jobs.
-                    log.warning(
-                        f"Unexplained failure (state={job['state']}) on build {build['number']} job {job['name']}"
-                    )
-                elif job['state'] == JOB_PASSED and (ducktape_fail
-                                                     or ctest_fail):
-                    # Sanity check that our CI logic is correctly reporting the result of jobs
-                    log.warning(
-                        f"Job passed but has test failures (state={job['state']}) on build {build['number']} job {job['name']}"
-                    )
+        # Loop over pages
+        n = 0
+        done = False
+        builds_url = BASE_URL + f"organizations/{ORGANIZATION}/pipelines/{PIPELINE}/builds"
+        while not done and builds_url is not None:
+            builds_response = self.get(builds_url, params=params)
+
+            try:
+                builds_url = builds_response.links['next']['url']
+                params = {}
+                log.debug(f"builds_url: {builds_url}")
+            except KeyError:
+                # End of pages
+                builds_url = None
+                log.debug(f"end of pages")
+
+            builds = builds_response.json()
+            for build in builds:
+                self._read_build(results, build)
+                n += 1
+                if max_n is not None and n >= max_n:
+                    done = True
+                    break
 
         if not results:
             # Treat this as an error to avoid falsely claiming everything is fine if
@@ -255,7 +296,8 @@ class ResultReader:
             sys.exit(-1)
 
         for case, result_list in results.items():
-            failures = [r for r in result_list if r.status != CASE_PASS]
+            failures = [r for r in result_list if r.status  not in (CASE_PASS, CASE_IGNORE)]
+            ignores = [r for r in result_list if r.status == CASE_IGNORE]
             if failures:
                 print(
                     f"Unstable test: {case} ({len(failures)}/{len(result_list)} runs failed)"
@@ -264,6 +306,8 @@ class ResultReader:
                 print(
                     f"  Most recent failure at {mrf.timestamp}: {mrf.message}\n"
                     f"                  in job {mrf.web_url}")
+            elif ignores:
+                print(f"Ignored test: {case} ({len(ignores)}/{len(result_list)} runs ignored)")
 
 
 if __name__ == '__main__':
@@ -272,6 +316,27 @@ if __name__ == '__main__':
     except IndexError:
         branch = DEFAULT_BRANCH
 
+    try:
+        since_str = sys.argv[2]
+    except IndexError:
+        since = None
+    else:
+        n = int(since_str[:-1])
+        unit = since_str[-1].lower()
+        if unit == 'h':
+            since = datetime.datetime.utcnow() - datetime.timedelta(hours=n)
+        elif unit == 'd':
+            since = datetime.datetime.utcnow() - datetime.timedelta(days=n)
+        elif unit == 'w':
+            since = datetime.datetime.utcnow() - datetime.timedelta(weeks=n)
+        else:
+            log.error("Unit must be one of h,d,w.  Like '72h' or '1w'")
+            sys.exit(-1)
+
+    if since is None:
+        # If we weren't asked for a finite time period, read the last N builds
+        max_n = DEFAULT_MAX_N
+
     reader = ResultReader(ResultReaderConfig())
     reader.validate()
-    reader.read(branch)
+    reader.read(branch, since=since)
