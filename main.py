@@ -6,6 +6,7 @@ import json
 import re
 from xml.etree import ElementTree
 from collections import defaultdict
+import concurrent.futures
 
 import requests
 
@@ -25,6 +26,8 @@ CASE_IGNORE = "ignore"
 # Buildkite's strings for job status
 JOB_FAILED = 'failed'
 JOB_PASSED = 'passed'
+JOB_WAITING_FAILED = 'waiting_failed'
+JOB_BROKEN = 'broken'
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
@@ -233,7 +236,10 @@ class ResultReader:
         Treat a whole job like one test case
         """
         suite = klass = case = job['name']
-        status = CASE_PASS if job['state'] == JOB_PASSED else CASE_FAIL
+
+        # Why tolerate JOB_WAITING_FAILED/JOB_BROKEN?  Because in our CI, the multiarch-image job is not
+        # run if any of the main redpanda test jobs fail, and comes through with that status
+        status = CASE_PASS if job['state'] in (JOB_PASSED, JOB_WAITING_FAILED, JOB_BROKEN) else CASE_FAIL
         results[TestCase(suite, klass, case)].append(
             TestResult(build['number'], job['id'], suite, klass, case, status, None,
                        job['web_url'], job['finished_at']))
@@ -281,25 +287,32 @@ class ResultReader:
         n = 0
         done = False
         builds_url = BASE_URL + f"organizations/{ORGANIZATION}/pipelines/{PIPELINE}/builds"
-        while not done and builds_url is not None:
-            builds_response = self.get(builds_url, params=params)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futs = []
 
-            try:
-                builds_url = builds_response.links['next']['url']
-                params = {}
-                log.debug(f"builds_url: {builds_url}")
-            except KeyError:
-                # End of pages
-                builds_url = None
-                log.debug(f"end of pages")
+            while not done and builds_url is not None:
+                builds_response = self.get(builds_url, params=params)
 
-            builds = builds_response.json()
-            for build in builds:
-                self._read_build(results, build)
-                n += 1
-                if max_n is not None and n >= max_n:
-                    done = True
-                    break
+                try:
+                    builds_url = builds_response.links['next']['url']
+                    params = {}
+                    log.debug(f"builds_url: {builds_url}")
+                except KeyError:
+                    # End of pages
+                    builds_url = None
+                    log.debug(f"end of pages")
+
+                builds = builds_response.json()
+                for build in builds:
+                    futs.append(executor.submit(self._read_build, results, build))
+                    n += 1
+                    if max_n is not None and n >= max_n:
+                        done = True
+                        break
+
+
+            for future in concurrent.futures.as_completed(futs):
+                future.result()
 
         if not results:
             # Treat this as an error to avoid falsely claiming everything is fine if
