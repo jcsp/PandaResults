@@ -180,6 +180,8 @@ class ResultReader:
         CTEST_RESULT_RE = re.compile(
             r"^\d+/\d+ Test #\d+: ([^\s]+) .*(Failed|Passed)\s+\d.*")
 
+        TERMINATOR_LINE = "Total Test time"
+
         any_failed = False
 
         # Carry partial lines at end of chunk
@@ -199,9 +201,16 @@ class ResultReader:
             # Examples:
             # 58/64 Test #58: test_archival_service_rpunit ......................***Failed   13.35 sec^M
             # 57/64 Test #57: s3_single_thread_rpunit ...........................   Passed    1.56 sec^M
+            stop = False
             for line in lines[:-1]:
                 line = line.strip()
                 line = line.decode('utf-8', 'backslashreplace')
+
+                if line.startswith(TERMINATOR_LINE):
+                    # Optimization: stop downloading the log once we've seen unit test results
+                    stop = True
+                    break
+
                 match = CTEST_RESULT_RE.match(line)
                 if match:
                     test_name, test_result = match.groups()
@@ -213,6 +222,9 @@ class ResultReader:
                         TestResult(build['number'], job['id'], "ctest",
                                    "ctest", test_name, status, None,
                                    job['web_url'], job['finished_at']))
+
+            if stop:
+                break
 
         return any_failed
 
