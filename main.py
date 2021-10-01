@@ -31,7 +31,7 @@ JOB_WAITING_FAILED = 'waiting_failed'
 JOB_BROKEN = 'broken'
 
 log = logging.getLogger(__name__)
-log.setLevel(logging.INFO)
+log.setLevel(logging.WARN)
 handler = logging.StreamHandler()
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
@@ -39,8 +39,17 @@ log.addHandler(handler)
 
 
 class TestResult:
-    def __init__(self, build_number, job_id, suite, klass, case, status, xml,
-                 web_url, ran_at):
+    def __init__(self,
+                 build_number,
+                 job_id,
+                 suite,
+                 klass,
+                 case,
+                 status,
+                 xml,
+                 web_url,
+                 ran_at,
+                 message=None):
         self.build_number = build_number
         self.job_id = job_id
         self.suite = suite
@@ -50,6 +59,7 @@ class TestResult:
         self.xml = xml
         self.web_url = web_url
         self.ran_at = ran_at
+        self._message = message
 
     @property
     def timestamp(self):
@@ -57,6 +67,9 @@ class TestResult:
 
     @property
     def message(self):
+        if self._message:
+            return self._message
+
         if self.xml is None:
             return None
 
@@ -134,7 +147,8 @@ class ResultReader:
             report_artifact = artifacts_by_name['report.xml']
         except KeyError:
             log.warning(
-                f"No report.xml for job (status={job['state']}) {job['web_url']}")
+                f"No report.xml for job (status={job['state']}) {job['web_url']}"
+            )
             return
 
         # The buildkite API gives us a buildkite location for download, but
@@ -176,12 +190,45 @@ class ResultReader:
 
         return any_failed
 
+    def _read_log_lines(self, job, terminator=None):
+        r = self.get(job['raw_log_url'])
+
+        # Carry partial lines at end of chunk
+        partial = None
+
+        for chunk in r.iter_content(chunk_size=32768):
+            lines = chunk.split(b"\n")
+            lines = [l.strip() for l in lines]
+            lines = [l for l in lines if l]
+
+            if partial is not None:
+                composed = partial + lines[0]
+                partial = lines[-1]
+                lines = [composed] + lines[1:-1]
+            else:
+                partial = lines[-1]
+                lines = lines[:-1]
+
+            stop = False
+            for line in lines:
+                line = line.strip()
+                line = line.decode('utf-8', 'backslashreplace')
+
+                if terminator and line.startswith(terminator):
+                    # Optimization: stop downloading the log once we've seen unit test results
+                    stop = True
+                    break
+
+                yield line
+
+            if stop:
+                break
+
     def _read_ctest_results(self, results, build, job):
         """
         CMake only added machine readable output in 3.21, which is not available on most
         distros.  So for the moment, scrape unit test output from the log.
         """
-        r = self.get(job['raw_log_url'])
 
         CTEST_RESULT_RE = re.compile(
             r"^\d+/\d+ Test #\d+: ([^\s]+) .*(Failed|Passed)\s+\d.*")
@@ -190,47 +237,21 @@ class ResultReader:
 
         any_failed = False
 
-        # Carry partial lines at end of chunk
-        partial = None
-
-        for chunk in r.iter_content(chunk_size=32768):
-            lines = chunk.split(b"\n")
-
-            if partial is not None:
-                composed = partial + lines[0]
-                partial = lines[-1]
-                lines = [composed] + lines[1:-1]
-
-            ##print(f"partial = {partial}")
-            #print(lines)
-
+        for line in self._read_log_lines(job, TERMINATOR_LINE):
             # Examples:
             # 58/64 Test #58: test_archival_service_rpunit ......................***Failed   13.35 sec^M
             # 57/64 Test #57: s3_single_thread_rpunit ...........................   Passed    1.56 sec^M
-            stop = False
-            for line in lines[:-1]:
-                line = line.strip()
-                line = line.decode('utf-8', 'backslashreplace')
+            match = CTEST_RESULT_RE.match(line)
+            if match:
+                test_name, test_result = match.groups()
+                status = CASE_PASS if test_result == "Passed" else CASE_FAIL
+                any_failed = any_failed or status == CASE_FAIL
 
-                if line.startswith(TERMINATOR_LINE):
-                    # Optimization: stop downloading the log once we've seen unit test results
-                    stop = True
-                    break
-
-                match = CTEST_RESULT_RE.match(line)
-                if match:
-                    test_name, test_result = match.groups()
-                    status = CASE_PASS if test_result == "Passed" else CASE_FAIL
-                    any_failed = any_failed or status == CASE_FAIL
-
-                    log.debug(f"Unit test {test_name} {status}")
-                    results[TestCase("ctest", "ctest", test_name)].append(
-                        TestResult(build['number'], job['id'], "ctest",
-                                   "ctest", test_name, status, None,
-                                   job['web_url'], job['finished_at']))
-
-            if stop:
-                break
+                log.debug(f"Unit test {test_name} {status}")
+                results[TestCase("ctest", "ctest", test_name)].append(
+                    TestResult(build['number'], job['id'], "ctest", "ctest",
+                               test_name, status, None, job['web_url'],
+                               job['finished_at']))
 
         return any_failed
 
@@ -242,14 +263,48 @@ class ResultReader:
 
         # Why tolerate JOB_WAITING_FAILED/JOB_BROKEN?  Because in our CI, the multiarch-image job is not
         # run if any of the main redpanda test jobs fail, and comes through with that status
-        status = CASE_PASS if job['state'] in (JOB_PASSED, JOB_WAITING_FAILED, JOB_BROKEN) else CASE_FAIL
+        status = CASE_PASS if job['state'] in (JOB_PASSED, JOB_WAITING_FAILED,
+                                               JOB_BROKEN) else CASE_FAIL
         results[TestCase(suite, klass, case)].append(
-            TestResult(build['number'], job['id'], suite, klass, case, status, None,
-                       job['web_url'], job['finished_at']))
+            TestResult(build['number'], job['id'], suite, klass, case, status,
+                       None, job['web_url'], job['finished_at']))
+
+    def _read_timed_out(self, results, build, job):
+        tests_started = set()
+        tests_finished = set()
+
+        for line in self._read_log_lines(job):
+            m1 = re.search("RunnerClient: rptest.tests.(.+): Summary", line)
+            if m1:
+                tests_finished.add(m1.group(1))
+            else:
+                m2 = re.search(
+                    "RunnerClient: rptest.tests.(.+): Running\.\.\.", line)
+                if m2:
+                    tests_started.add(m2.group(1))
+
+        unfinished = tests_started - tests_finished
+
+        if unfinished:
+            log.error(f"Unfinished tests {unfinished} {job['web_url']}")
+            for u in unfinished:
+                suite, klass, case = u.split(".")
+                results[TestCase(suite, klass, case)].append(
+                    TestResult(build['number'],
+                               job['id'],
+                               suite,
+                               klass,
+                               case,
+                               CASE_FAIL,
+                               None,
+                               job['web_url'],
+                               job['finished_at'],
+                               message="Started but didn't finish!"))
+        else:
+            log.error(f"Timed out job with no stuck ducktape cases: {job['web_url']}")
 
     def _read_build(self, results, build):
-        log.debug(
-            f"{build['finished_at']} {build['number']} {build['state']}")
+        log.debug(f"{build['finished_at']} {build['number']} {build['state']}")
         for job in build['jobs']:
             name = job['name']
             if DUCKTAPE_JOBS.match(name) is None:
@@ -258,8 +313,14 @@ class ResultReader:
                 self._read_monolithic_results(results, build, job)
                 continue
 
-            ducktape_fail = self._read_ducktape_results(
-                results, build, job)
+            if job['state'] == 'timed_out':
+                # Special case for timed out jobs: in case a ducktape test was
+                # the source of the hang, scrape the log for tests that are seen
+                # to start but are not seen to complete
+                self._read_timed_out(results, build, job)
+                continue
+
+            ducktape_fail = self._read_ducktape_results(results, build, job)
             ctest_fail = self._read_ctest_results(results, build, job)
 
             if job['state'] != JOB_PASSED and not ducktape_fail and not ctest_fail:
@@ -268,8 +329,7 @@ class ResultReader:
                 log.warning(
                     f"Unexplained failure (state={job['state']}) on {job['web_url']}"
                 )
-            elif job['state'] == JOB_PASSED and (ducktape_fail
-                                                 or ctest_fail):
+            elif job['state'] == JOB_PASSED and (ducktape_fail or ctest_fail):
                 # Sanity check that our CI logic is correctly reporting the result of jobs
                 log.warning(
                     f"Job passed but has test failures (state={job['state']}) on {job['web_url']}"
@@ -307,12 +367,12 @@ class ResultReader:
 
                 builds = builds_response.json()
                 for build in builds:
-                    futs.append(executor.submit(self._read_build, results, build))
+                    futs.append(
+                        executor.submit(self._read_build, results, build))
                     n += 1
                     if max_n is not None and n >= max_n:
                         done = True
                         break
-
 
             for future in concurrent.futures.as_completed(futs):
                 future.result()
@@ -324,7 +384,10 @@ class ResultReader:
             sys.exit(-1)
 
         for case, result_list in results.items():
-            failures = [r for r in result_list if r.status  not in (CASE_PASS, CASE_IGNORE)]
+            failures = [
+                r for r in result_list
+                if r.status not in (CASE_PASS, CASE_IGNORE)
+            ]
             ignores = [r for r in result_list if r.status == CASE_IGNORE]
             if failures:
                 print(
@@ -341,15 +404,24 @@ class ResultReader:
                         f"  Latest failure at {mrf.timestamp}: {mrf.message}\n"
                         f"             in job {mrf.web_url}")
             elif ignores:
-                print(f"Ignored test: {case} ({len(ignores)}/{len(result_list)} runs ignored)")
+                print(
+                    f"Ignored test: {case} ({len(ignores)}/{len(result_list)} runs ignored)"
+                )
 
 
 if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser(description='Analyze Redpanda test results')
-    parser.add_argument('branch', help="redpanda branch name (e.g. dev)", default=DEFAULT_BRANCH)
-    parser.add_argument('since', help="How far back to look from present time", default=None)
-    parser.add_argument('--all', action=argparse.BooleanOptionalAction, help="Output all failures, not just latest")
+    parser = argparse.ArgumentParser(
+        description='Analyze Redpanda test results')
+    parser.add_argument('branch',
+                        help="redpanda branch name (e.g. dev)",
+                        default=DEFAULT_BRANCH)
+    parser.add_argument('since',
+                        help="How far back to look from present time",
+                        default=None)
+    parser.add_argument('--all',
+                        action=argparse.BooleanOptionalAction,
+                        help="Output all failures, not just latest")
     args = parser.parse_args()
 
     if args.since:
