@@ -1,3 +1,4 @@
+import argparse
 import datetime
 import sys
 import os
@@ -90,10 +91,12 @@ class TestCase:
 
 
 class ResultReaderConfig:
-    def __init__(self):
+    def __init__(self, all_results):
         j = json.load(open(os.path.expanduser(CONFIG_PATH)))
         self.buildkite_token = j['buildkite_token']
         self.artifact_auth = tuple(j['artifact_auth'])
+
+        self.all_results = all_results
 
 
 class ResultReader:
@@ -327,25 +330,30 @@ class ResultReader:
                 print(
                     f"Unstable test: {case} ({len(failures)}/{len(result_list)} runs failed)"
                 )
-                mrf = failures[0]
-                print(
-                    f"  Most recent failure at {mrf.timestamp}: {mrf.message}\n"
-                    f"                  in job {mrf.web_url}")
+                if self.config.all_results:
+                    for failure in failures:
+                        print(
+                            f"  failure at {failure.timestamp}: {failure.message}\n"
+                            f"      in job {failure.web_url}")
+                else:
+                    mrf = failures[0]
+                    print(
+                        f"  Latest failure at {mrf.timestamp}: {mrf.message}\n"
+                        f"             in job {mrf.web_url}")
             elif ignores:
                 print(f"Ignored test: {case} ({len(ignores)}/{len(result_list)} runs ignored)")
 
 
 if __name__ == '__main__':
-    try:
-        branch = sys.argv[1]
-    except IndexError:
-        branch = DEFAULT_BRANCH
 
-    try:
-        since_str = sys.argv[2]
-    except IndexError:
-        since = None
-    else:
+    parser = argparse.ArgumentParser(description='Analyze Redpanda test results')
+    parser.add_argument('branch', help="redpanda branch name (e.g. dev)", default=DEFAULT_BRANCH)
+    parser.add_argument('since', help="How far back to look from present time", default=None)
+    parser.add_argument('--all', action=argparse.BooleanOptionalAction, help="Output all failures, not just latest")
+    args = parser.parse_args()
+
+    if args.since:
+        since_str = args.since
         n = int(since_str[:-1])
         unit = since_str[-1].lower()
         if unit == 'h':
@@ -357,11 +365,13 @@ if __name__ == '__main__':
         else:
             log.error("Unit must be one of h,d,w.  Like '72h' or '1w'")
             sys.exit(-1)
+    else:
+        since = None
 
     if since is None:
         # If we weren't asked for a finite time period, read the last N builds
         max_n = DEFAULT_MAX_N
 
-    reader = ResultReader(ResultReaderConfig())
+    reader = ResultReader(ResultReaderConfig(args.all))
     reader.validate()
-    reader.read(branch, since=since)
+    reader.read(args.branch, since=since)
