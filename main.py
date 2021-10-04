@@ -170,6 +170,10 @@ class ResultReader:
             assert test_suite.tag == 'testsuite'
             for test_case in test_suite:
                 assert test_case.tag == 'testcase'
+                suite_name = test_suite.attrib['name'],
+                if isinstance(suite_name, tuple):
+                    suite_name = suite_name[0]
+                suite_name = suite_name.split(".")[-1]
                 class_name = test_case.attrib['classname']
                 name = test_case.attrib['name']
                 status = test_case.attrib['status']
@@ -177,14 +181,14 @@ class ResultReader:
                 log.debug(f"{class_name}.{name} {status}")
 
                 results[TestCase(
-                    test_suite.attrib['name'],
-                    test_case.attrib['classname'],
-                    test_case.attrib['name'],
+                    suite_name,
+                    class_name,
+                    name,
                 )].append(
                     TestResult(build['number'], job['id'],
-                               test_suite.attrib['name'],
-                               test_case.attrib['classname'],
-                               test_case.attrib['name'],
+                               suite_name,
+                               class_name,
+                               name,
                                test_case.attrib['status'], test_case,
                                job['web_url'], job['finished_at']))
 
