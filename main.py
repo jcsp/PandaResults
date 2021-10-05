@@ -146,7 +146,7 @@ class ResultReader:
         try:
             report_artifact = artifacts_by_name['report.xml']
         except KeyError:
-            log.warning(
+            log.info(
                 f"No report.xml for job (status={job['state']}) {job['web_url']}"
             )
             return
@@ -259,6 +259,24 @@ class ResultReader:
 
         return any_failed
 
+    def _read_js_failures(self, results, build, job ):
+        # Output like
+        #  40 passing (266ms)
+        #  12 failing
+
+        log.info("Scanning for JS failures")
+        for line in self._read_log_lines(job, None):
+            if re.match("^\d+ failing$", line):
+                log.info(f"JS test fail (line '{line}')")
+                results[TestCase("build-js", "build-js", "build")].append(
+                    TestResult(build['number'], job['id'], "build-js", "build-js",
+                               "build", CASE_FAIL, None, job['web_url'],
+                               job['finished_at']))
+                return True
+
+        return False
+
+
     def _read_monolithic_results(self, results, build, job):
         """
         Treat a whole job like one test case
@@ -325,14 +343,21 @@ class ResultReader:
                 continue
 
             ducktape_fail = self._read_ducktape_results(results, build, job)
-            ctest_fail = self._read_ctest_results(results, build, job)
+            if not ducktape_fail:
+                # Scraping log is expensive.  Only do it if we didn't see
+                # a ducktape failure
+                ctest_fail = self._read_ctest_results(results, build, job)
+            else:
+                ctest_fail = False
 
             if job['state'] != JOB_PASSED and not ducktape_fail and not ctest_fail:
-                # If a job is failed, we expect to have seen some test failures.  Otherwise log a warning
-                # to avoid wrongly ignoring failed jobs.
-                log.warning(
-                    f"Unexplained failure (state={job['state']}) on {job['web_url']}"
-                )
+                # Special check for JS test failures
+                if not self._read_js_failures(results, build, job):
+                    # If a job is failed, we expect to have seen some test failures.  Otherwise log a warning
+                    # to avoid wrongly ignoring failed jobs.
+                    log.warning(
+                        f"Unexplained failure (state={job['state']}) on {job['web_url']}"
+                    )
             elif job['state'] == JOB_PASSED and (ducktape_fail or ctest_fail):
                 # Sanity check that our CI logic is correctly reporting the result of jobs
                 log.warning(
