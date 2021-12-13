@@ -310,7 +310,7 @@ class ResultReader:
         if unfinished:
             log.error(f"Unfinished tests {unfinished} {job['web_url']}")
             for u in unfinished:
-                suite, klass, case = u.split(".")
+                suite, klass, case = u.split(".")[:3]
                 results[TestCase(suite, klass, case)].append(
                     TestResult(build['number'],
                                job['id'],
